@@ -34,9 +34,10 @@ class BackgroundManager:
         task_manager = TaskManager(data, **kwargs)
         await self._queue.put(task_manager)
 
-    async def start(self):
+    def start(self):
         # Start processing tasks concurrently
-        await self._process()
+        asyncio.create_task(self._process())
+        logger.info("Background processing started.")
 
     async def _process(self):
         while not self._shutdown_event.is_set():
@@ -63,8 +64,9 @@ class BackgroundManager:
             # Avoid busy-waiting by sleeping for a short interval
             await asyncio.sleep(0.1)
 
-    async def _process_task(self, task_manager: TaskManager):
+    async def _process_task(self, task_manager: "TaskManager"):
         try:
+            logger.info(f"Processing task: {task_manager._data}")
             await task_manager.process()
         except Exception as e:
             logger.error(f"Task processing failed: {e}")
@@ -144,15 +146,16 @@ class TaskManager:
 async def main():
     manager = BackgroundManager()
 
+    # Start processing tasks in the background
+    manager.start()
+
     # Add tasks to the manager (example task data)
     for i in range(10):
         data = {"id": i, "data": {"name": f"Task {i}"}}
-        await manager.start_background_processing(data)
+        asyncio.create_task(manager.start_background_processing(data))
 
-    # Start processing tasks in the background
-    await manager.start()
-
-    # Optionally, stop the manager after some time or upon application shutdown
+    print("Background processing started.")
+    # # Optionally, stop the manager after some time or upon application shutdown
     await asyncio.sleep(10)  # Simulate runtime
     await manager.stop()
 

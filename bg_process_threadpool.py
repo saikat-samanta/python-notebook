@@ -1,11 +1,12 @@
 import asyncio
 import logging
-from aiohttp import ClientSession, ClientTimeout
-from concurrent.futures import ProcessPoolExecutor
-from enum import Enum
-import random
 import time
-import os
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+from queue import Empty, Queue
+from typing import Dict
+
+from aiohttp import ClientSession
 
 # Logger setup
 logging.basicConfig(
@@ -15,6 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Enum for task states
 class TaskManagerState(Enum):
     Pending = "pending"
     Generating = "generating"
@@ -24,157 +26,116 @@ class TaskManagerState(Enum):
 
 class BackgroundManager:
     MAX_CONCURRENT_WORKERS = 5
-    RETRY_LIMIT = 3  # Max number of retries on failure
-    TASK_TIMEOUT = 30  # Timeout for each task in seconds
+    QUEUE_TIMEOUT = 1  # Time in seconds before checking queue again
 
     def __init__(self):
-        self._queue: asyncio.Queue[TaskManager] = asyncio.Queue()
-        self._workers: set[TaskManager] = set()
+        self._queue: Queue[TaskManager] = Queue()
         self._shutdown_event = asyncio.Event()
-        self._executor = ProcessPoolExecutor(
-            max_workers=5
-        )  # CPU-bound tasks handled by separate processes
+        self._executor = ThreadPoolExecutor(
+            max_workers=BackgroundManager.MAX_CONCURRENT_WORKERS
+        )
 
-    async def start_background_processing(self, data, **kwargs):
-        """Add task to the queue for processing."""
-        task_manager = TaskManager(data, self._executor, **kwargs)
-        await self._queue.put(task_manager)
+    def start_background_processing(self, data: Dict, **kwargs):
+        """Add task to queue for background processing."""
+        task_manager = TaskManager(data, **kwargs)
+        self._queue.put(task_manager)
 
-    async def start(self):
-        """Start the task processing."""
-        await self._process()
+    def start(self):
+        """Start background workers to process tasks in the queue."""
+        logger.info(
+            f"Starting {BackgroundManager.MAX_CONCURRENT_WORKERS} worker threads."
+        )
+        for _ in range(BackgroundManager.MAX_CONCURRENT_WORKERS):
+            self._executor.submit(self._process)
 
-    async def _process(self):
-        """Process tasks from the queue using a limited number of workers."""
-        while not self._shutdown_event.is_set():
-            if (
-                len(self._workers) < BackgroundManager.MAX_CONCURRENT_WORKERS
-                and not self._queue.empty()
-            ):
-                task_manager = await self._queue.get()
-                self._workers.add(task_manager)
-                asyncio.create_task(self._process_task(task_manager))
-
-            # Clean up finished or failed tasks
-            finished_tasks = {
-                task
-                for task in self._workers
-                if task.state in {TaskManagerState.Finished, TaskManagerState.Failed}
-            }
-            await asyncio.gather(*(task.finalize() for task in finished_tasks))
-            self._workers -= finished_tasks
-
-            await asyncio.sleep(0.1)  # Avoid busy-waiting
-
-    async def _process_task(self, task_manager: "TaskManager"):
-        try:
-            await task_manager.process()
-        except Exception as e:
-            logger.error(f"Task processing failed: {e}")
-        finally:
-            self._workers.remove(task_manager)
-
-    async def stop(self):
-        """Gracefully shut down by waiting for all tasks to finish."""
+    def stop(self):
+        """Gracefully stop the worker threads."""
+        logger.info("Stopping workers.")
         self._shutdown_event.set()
-        while self._workers:
-            await asyncio.sleep(0.1)
-        logger.info("All tasks have been processed and background manager is stopped.")
+        self._executor.shutdown(wait=True)
+
+    def _process(self):
+        """Process tasks from the queue in worker threads based on their status."""
+        while not self._shutdown_event.is_set():
+            try:
+                task_manager = self._queue.get(timeout=BackgroundManager.QUEUE_TIMEOUT)
+                if task_manager and task_manager.state == TaskManagerState.Pending:
+                    logger.info(f"Processing task: {task_manager._data}")
+                    task_manager.process()
+                    self._queue.task_done()
+                else:
+                    # Skip processing if the task is not in 'Pending' state
+                    logger.info(
+                        f"Skipping task {task_manager._data} as it is already {task_manager.state.value}"
+                    )
+            except Empty:
+                time.sleep(0.1)
+                continue
+            except Exception as e:
+                logger.error(f"Error processing task: {str(e)}")
 
 
 class TaskManager:
-    def __init__(self, data, executor: ProcessPoolExecutor, **kwargs):
+    def __init__(self, data: Dict, **kwargs):
         self._data = data
         self.state = TaskManagerState.Pending
-        self.retry_count = 0
-        self._executor = executor
+        self._session: ClientSession = None
 
-    async def process(self):
-        """Process the task with retries and backoff."""
+    def process(self):
+        """Process the task asynchronously within the thread."""
+        self.state = TaskManagerState.Generating
         try:
-            async with ClientSession(
-                timeout=ClientTimeout(total=BackgroundManager.TASK_TIMEOUT)
-            ) as session:
-                # Start I/O-bound tasks concurrently
-                await self._initial_task(session)
-                task1 = asyncio.create_task(self._generate_first_task(session))
-                task2 = asyncio.create_task(self._generate_second_task(session))
-
-                # Wait for both I/O-bound tasks to complete
-                await asyncio.gather(task1, task2)
-
-            # Handle CPU-bound task
-            await self._handle_cpu_task()
-
+            # Run async tasks within the thread using asyncio event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)  # Setting a new event loop for this thread
+            loop.run_until_complete(self._process())
             self.state = TaskManagerState.Finished
         except Exception as e:
             self.state = TaskManagerState.Failed
-            logger.error(f"Error processing task: {e}")
-            await self._handle_failure(e)
+            logger.error(f"Error processing task: {str(e)}")
+        finally:
+            loop.close()
+
+    async def _process(self):
+        """Perform the actual async tasks."""
+        try:
+            async with ClientSession() as session:
+                self._session = session
+                await self._initial_task(session)
+                await asyncio.gather(
+                    self._generate_first_task(session),
+                    # Additional tasks can be added here
+                )
+            await self.finalize()
+        except Exception as e:
+            logger.error(f"Failed during task processing: {str(e)}")
+            raise
 
     async def _initial_task(self, session: ClientSession):
-        """Simulate an initial IO-bound task."""
+        """Perform the initial task for the data."""
         self._data["data"] = {}
 
     async def _generate_first_task(self, session: ClientSession):
-        """Simulate an IO-bound task (e.g., HTTP request)."""
-        await asyncio.sleep(1)  # Simulating network delay
-        self._data["data"]["first"] = f"test_data_{random.randint(1000, 9999)}"
-
-    async def _generate_second_task(self, session: ClientSession):
-        """Simulate another IO-bound task."""
-        await asyncio.sleep(1)  # Simulating another network delay
-        self._data["data"]["second"] = f"extra_data_{random.randint(1000, 9999)}"
-
-    async def _handle_cpu_task(self):
-        """Handle CPU-intensive task in a separate process using the executor."""
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(self._executor, self._cpu_bound_task)
-        self._data["data"]["cpu_result"] = result
-
-    def _cpu_bound_task(self):
-        """Simulate a CPU-intensive task (e.g., a complex calculation)."""
-        logger.info(f"Running CPU-intensive task in process {os.getpid()}")
-        time.sleep(3)  # Simulating CPU-bound work
-        return random.randint(10000, 99999)
-
-    async def _handle_failure(self, error):
-        """Handle task failure with retries and exponential backoff."""
-        if self.retry_count < BackgroundManager.RETRY_LIMIT:
-            self.retry_count += 1
-            logger.info(
-                f"Retrying task ({self.retry_count}/{BackgroundManager.RETRY_LIMIT}) due to error: {error}"
-            )
-            await asyncio.sleep(2**self.retry_count)  # Exponential backoff
-            await self.process()  # Retry the task
-        else:
-            logger.error("Max retry limit reached, task failed permanently.")
+        """Simulate a data generation task."""
+        self._data["data"]["first"] = "test_data"
 
     async def finalize(self):
-        """Finalize task processing."""
-        if self.state == TaskManagerState.Finished:
-            logger.info(f"Task completed: {self._data}")
-        else:
-            logger.error(f"Task failed: {self._data}")
-        print(self._data)  # Placeholder for actual processing like DB update
+        """Finalize the task processing."""
+        logger.info(f"Task completed: {self._data}")
+        # Placeholder for actual processing like DB update, logging, etc.
 
 
-# Example usage
-async def main():
-    manager = BackgroundManager()
+# Example Usage
+if __name__ == "__main__":
+    background_manager = BackgroundManager()
+    background_manager.start()
 
-    # Add tasks to the manager
+    # Add tasks to the queue
     for i in range(10):
-        data = {"id": i, "data": {"name": f"Task {i}"}}
-        await manager.start_background_processing(data)
+        background_manager.start_background_processing({"task_id": i})
 
-    # Start processing tasks
-    await manager.start()
+    print("Background processing started.")
 
     # Optionally, stop the manager after some time or upon application shutdown
-    await asyncio.sleep(10)  # Simulate runtime
-    await manager.stop()
-
-
-# Run the main function
-asyncio.run(main())
+    time.sleep(10)  # Simulate runtime
+    background_manager.stop()

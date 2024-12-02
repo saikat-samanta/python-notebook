@@ -140,8 +140,8 @@ if __name__ == "__main__":
     for i in range(10):
         background_manager.start_background_processing({"task_id": i})
 
-    try:
-        # Let the background tasks run for a while
-        time.sleep(10)  # Simulate running for 10 seconds
-    finally:
-        background_manager.stop()
+    print("Background processing started.")
+
+    # # Optionally, stop the manager after some time or upon application shutdown
+    time.sleep(10)  # Simulate runtime
+    background_manager.stop()
