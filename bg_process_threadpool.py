@@ -37,7 +37,7 @@ class BackgroundManager:
 
     async def start_background_processing(self, data, **kwargs):
         """Add task to the queue for processing."""
-        task_manager = TaskManager(data, **kwargs)
+        task_manager = TaskManager(data, self._executor, **kwargs)
         await self._queue.put(task_manager)
 
     async def start(self):
@@ -83,10 +83,11 @@ class BackgroundManager:
 
 
 class TaskManager:
-    def __init__(self, data):
+    def __init__(self, data, executor: ProcessPoolExecutor, **kwargs):
         self._data = data
         self.state = TaskManagerState.Pending
         self.retry_count = 0
+        self._executor = executor
 
     async def process(self):
         """Process the task with retries and backoff."""
@@ -94,12 +95,15 @@ class TaskManager:
             async with ClientSession(
                 timeout=ClientTimeout(total=BackgroundManager.TASK_TIMEOUT)
             ) as session:
+                # Start I/O-bound tasks concurrently
                 await self._initial_task(session)
-                # Simulate IO-bound task
-                await self._generate_first_task(session)
-                await self._generate_second_task(session)
+                task1 = asyncio.create_task(self._generate_first_task(session))
+                task2 = asyncio.create_task(self._generate_second_task(session))
 
-            # Now handle the CPU-intensive task
+                # Wait for both I/O-bound tasks to complete
+                await asyncio.gather(task1, task2)
+
+            # Handle CPU-bound task
             await self._handle_cpu_task()
 
             self.state = TaskManagerState.Finished
